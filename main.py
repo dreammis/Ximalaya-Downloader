@@ -1,4 +1,3 @@
-# -*- coding:utf-8 -*-
 import asyncio
 import base64
 import binascii
@@ -15,12 +14,13 @@ import aiohttp
 import requests
 from Crypto.Cipher import AES
 from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from selenium import webdriver
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import selenium.common.exceptions
 import colorama
+
+from conf import BASE_DIR
 
 colorama.init(autoreset=True)
 logger = logging.getLogger('logger')
@@ -30,51 +30,14 @@ file_handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
-path = ""
-
 
 class Ximalaya:
-    def __init__(self):
+    def __init__(self, account_name="vip"):
         self.default_headers = {
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1660.14"
         }
-
-    # 解析声音，如果成功返回声音名和声音链接，否则返回False
-    def analyze_sound(self, sound_id, headers):
-        logger.debug(f'开始解析ID为{sound_id}的声音')
-        url = f"https://www.ximalaya.com/mobile-playpage/track/v3/baseInfo/{int(time.time() * 1000)}"
-        params = {
-            "device": "web",
-            "trackId": sound_id,
-            "trackQualityLevel": 2
-        }
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-        except Exception as e:
-            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
-            logger.debug(f'ID为{sound_id}的声音解析失败！')
-            logger.debug(traceback.format_exc())
-            return False
-        if not response.json()["trackInfo"]["isAuthorized"]:
-            return 0  # 未购买或未登录vip账号
-        try:
-            sound_name = response.json()["trackInfo"]["title"]
-            encrypted_url_list = response.json()["trackInfo"]["playUrlList"]
-        except Exception as e:
-            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
-            logger.debug(f'ID为{sound_id}的声音解析失败！')
-            logger.debug(traceback.format_exc())
-            return False
-        sound_info = {"name": sound_name, 0: "", 1: "", 2: ""}
-        for encrypted_url in encrypted_url_list:
-            if encrypted_url["type"] == "M4A_128":
-                sound_info[2] = self.decrypt_url(encrypted_url["url"])
-            elif encrypted_url["type"] == "MP3_64":
-                sound_info[1] = self.decrypt_url(encrypted_url["url"])
-            elif encrypted_url["type"] == "MP3_32":
-                sound_info[0] = self.decrypt_url(encrypted_url["url"])
-        logger.debug(f'ID为{sound_id}的声音解析成功！')
-        return sound_info
+        self.conf_path = BASE_DIR / "config" / f"{account_name}.conf"
+        self.download_path = BASE_DIR / ".tmp" / "ximalaya"
 
     # 解析专辑，如果成功返回专辑名和专辑声音列表，否则返回False
     def analyze_album(self, album_id):
@@ -197,9 +160,8 @@ class Ximalaya:
         else:
             type = sound_url[-3:]
         album_name = self.replace_invalid_chars(album_name)
-        if not os.path.exists(f"{path}/{album_name}"):
-            os.makedirs(f"{path}/{album_name}")
-        if os.path.exists(f"{path}/{album_name}/{sound_name}.{type}"):
+        path.mkdir(exist_ok=True)
+        if (path / f"{album_name}/{sound_name}.{type}").exists():
             print(f'{sound_name}已存在！')
             return None
         while retries > 0:
@@ -291,32 +253,12 @@ class Ximalaya:
             return 2  # 未购专辑
 
     # 获取配置文件中的cookie和path
-    def analyze_config(self):
+    def analyze_config(self) -> str:
         try:
-            with open("config.json", "r", encoding="utf-8") as f:
-                config = json.load(f)
-        except Exception:
-            with open("config.json", "w", encoding="utf-8") as f:
-                config = {
-                    "cookie": "",
-                    "path": ""
-                }
-                json.dump(config, f)
-            return False, False
-        try:
-            cookie = config["cookie"]
-        except Exception:
-            config["cookie"] = ""
-            with open("config.json", "w", encoding="utf-8") as f:
-                json.dump(config, f)
-            cookie = False
-        try:
-            path = config["path"]
-        except Exception:
-            config["path"] = ""
-            with open("config.json", "w", encoding="utf-8") as f:
-                json.dump(config, f)
-        return cookie, path
+            with open(self.conf_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            return ""
 
     # 判断cookie是否有效
     def judge_cookie(self, cookie):
@@ -338,66 +280,69 @@ class Ximalaya:
 
     # 登录喜马拉雅账号
     def login(self):
-        print("请输入登录方式：")
-        print("1. 在浏览器中登录并自动提取cookie")
-        print("2. 手动输入cookie")
-        choice = input()
-        if choice == "1":
-            print("请选择浏览器：")
-            print("1. Google Chrome")
-            print("2. Microsoft Edge")
-            choice = input()
-            if choice == "1":
-                option = webdriver.ChromeOptions()
-                option.add_experimental_option("detach", True)
-                option.add_experimental_option('excludeSwitches', ['enable-logging'])
-                driver = webdriver.Chrome(ChromeDriverManager().install(), options=option)
-            elif choice == "2":
-                option = webdriver.EdgeOptions()
-                option.add_experimental_option("detach", True)
-                option.add_experimental_option('excludeSwitches', ['enable-logging'])
-                driver = webdriver.Edge(EdgeChromiumDriverManager().install(), options=option)
-            else:
-                return
-            print("请在弹出的浏览器中登录喜马拉雅账号，登陆成功浏览器会自动关闭")
-            driver.get("https://passport.ximalaya.com/page/web/login")
-            try:
-                WebDriverWait(driver, 300).until(EC.url_to_be("https://www.ximalaya.com/"))
-                cookies = driver.get_cookies()
-                logger.debug('以下是使用浏览器登录喜马拉雅账号时的浏览器日志：')
-                for entry in driver.get_log('browser'):
-                    logger.debug(entry['message'])
-                logger.debug('浏览器日志结束')
-                driver.quit()
-            except selenium.common.exceptions.TimeoutException:
-                print("登录超时，自动返回主菜单！")
-                logger.debug('以下是使用浏览器登录喜马拉雅账号时的浏览器日志：')
-                for entry in driver.get_log('browser'):
-                    logger.debug(entry['message'])
-                logger.debug('浏览器日志结束')
-                driver.quit()
-                return
-            cookie = ""
-            for cookie_ in cookies:
-                cookie += f"{cookie_['name']}={cookie_['value']}; "
-            with open("config.json", "r", encoding="utf-8") as f:
-                config = json.load(f)
-            config["cookie"] = cookie
-            with open("config.json", "w", encoding="utf-8") as f:
-                json.dump(config, f)
-        elif choice == "2":
-            print("请输入cookie：（获取方法详见README）")
-            cookie = input()
-            with open("config.json", "r", encoding="utf-8") as f:
-                config = json.load(f)
-            config["cookie"] = cookie
-            is_cookie_available = self.judge_cookie(cookie)
-            if is_cookie_available:
-                with open("config.json", "w", encoding="utf-8") as f:
-                    json.dump(config, f)
-                print("cookie设置成功！")
-            else:
-                print("cookie无效，将返回主菜单，建议使用方法1自动获取cookie！")
-                return
+        print("在浏览器中登录并自动提取cookie")
+        print("Google Chrome")
+        option = webdriver.ChromeOptions()
+        option.add_experimental_option("detach", True)
+        option.add_experimental_option('excludeSwitches', ['enable-logging'])
+        driver = webdriver.Chrome(ChromeDriverManager().install(), options=option)
+        print("请在弹出的浏览器中登录喜马拉雅账号，登陆成功浏览器会自动关闭")
+        driver.get("https://passport.ximalaya.com/page/web/login")
+        try:
+            WebDriverWait(driver, 300).until(EC.url_to_be("https://www.ximalaya.com/"))
+            cookies = driver.get_cookies()
+            logger.debug('以下是使用浏览器登录喜马拉雅账号时的浏览器日志：')
+            for entry in driver.get_log('browser'):
+                logger.debug(entry['message'])
+            logger.debug('浏览器日志结束')
+            driver.quit()
+        except selenium.common.exceptions.TimeoutException:
+            print("登录超时，自动返回主菜单！")
+            logger.debug('以下是使用浏览器登录喜马拉雅账号时的浏览器日志：')
+            for entry in driver.get_log('browser'):
+                logger.debug(entry['message'])
+            logger.debug('浏览器日志结束')
+            driver.quit()
+            return
+        cookie = ""
+        for cookie_ in cookies:
+            cookie += f"{cookie_['name']}={cookie_['value']}; "
+        with open(self.conf_path, "w", encoding="utf-8") as f:
+            json.dump(cookie, f)
         username = self.judge_cookie(cookie)
         print(f"成功登录账号{username}！")
+        return cookie
+
+
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    album_id = "77789950"
+    ximalaya = Ximalaya()
+    cookie = ximalaya.analyze_config()
+
+    if not cookie or not ximalaya.judge_cookie(ximalaya.analyze_config()):
+        print("登录信息过期重新登录！")
+        if not ximalaya.login():
+            print("似乎登录了也没卵用")
+            exit()
+
+    headers = {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1660.14",
+        "cookie": cookie
+    }
+
+    album_name, sounds = ximalaya.analyze_album(album_id)
+    if not sounds:
+        exit()
+    album_type = ximalaya.judge_album(album_id, headers)
+    if album_type == 0:
+        print(f"成功解析免费专辑{album_id}，专辑名{album_name}，共{len(sounds)}个声音")
+    elif album_type == 1:
+        print(f"成功解析已购付费专辑{album_id}，专辑名{album_name}，共{len(sounds)}个声音")
+    else:
+        print(f"成功解析付费专辑{album_id}，专辑名{album_name}，但是当前登陆账号未购买此专辑或未开通vip")
+    start = 1
+    end = len(sounds)
+    quality = 0 # 0 低质量 1 普通 2 高质量
+    loop.run_until_complete(ximalaya.get_selected_sounds(sounds, album_name, start, end, headers, 0, True, ximalaya.download_path))
