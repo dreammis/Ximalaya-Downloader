@@ -55,6 +55,7 @@ class Ximalaya:
             logger.debug(f'ID为{album_id}的专辑解析失败！')
             logger.debug(traceback.format_exc())
             return False, False
+        # 在此处增加对于声音的逻辑判断
         pages = math.ceil(response.json()["data"]["trackTotalCount"] / 100)
         sounds = []
         for page in range(1, pages + 1):
@@ -160,7 +161,8 @@ class Ximalaya:
         else:
             type = sound_url[-3:]
         album_name = self.replace_invalid_chars(album_name)
-        path.mkdir(exist_ok=True)
+        album_path = path / f"{album_name}"
+        album_path.mkdir(parents=True, exist_ok=True)
         if (path / f"{album_name}/{sound_name}.{type}").exists():
             print(f'{sound_name}已存在！')
             return None
