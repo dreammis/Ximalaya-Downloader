@@ -197,7 +197,8 @@ class Ximalaya:
         tasks = []
         if number:
             num = start
-            for sound_info in sounds_info:
+            # todo 临时测试设置10
+            for sound_info in sounds_info[:10]:
                 if sound_info is False or sound_info == 0:
                     continue
                 num_ = str(num).zfill(digits)
