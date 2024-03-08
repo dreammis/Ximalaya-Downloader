@@ -198,7 +198,7 @@ class Ximalaya:
         if number:
             num = start
             # todo 临时测试设置10
-            for sound_info in sounds_info[:10]:
+            for sound_info in sounds_info[:5]:
                 if sound_info is False or sound_info == 0:
                     continue
                 num_ = str(num).zfill(digits)
