@@ -21,6 +21,7 @@ import selenium.common.exceptions
 import colorama
 
 from conf import BASE_DIR
+from utils.exceptions import XMLimitError
 
 colorama.init(autoreset=True)
 logger = logging.getLogger('logger')
@@ -89,15 +90,13 @@ class Ximalaya:
                 response_json = json.loads(await response.text())
                 sound_name = response_json["trackInfo"]["title"]
                 encrypted_url_list = response_json["trackInfo"]["playUrlList"]
+        except KeyError:
+            print('解析失败，可能达到每日下载上限')
+            return False
         except Exception as e:
             print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
             logger.debug(f'ID为{sound_id}的声音解析失败！')
             logger.debug(traceback.format_exc())
-            return False
-        try:
-            not response.json()["trackInfo"]["isAuthorized"]
-        except KeyError:
-            print('解析失败，可能达到每日下载上限')
             return False
         if not response_json["trackInfo"]["isAuthorized"]:
             return 0  # 未购买或未登录vip账号
@@ -199,11 +198,14 @@ class Ximalaya:
             sound_id = sounds[i]["trackId"]
             tasks.append(asyncio.create_task(self.async_analyze_sound(sound_id, session, headers)))
         sounds_info = await asyncio.gather(*tasks)
+        # xm加密链接全部解密失败，意味着可能账号超出限制，需要手动下载
+        if not all(sounds_info):
+            raise XMLimitError("也许触发了xm的日限制！")
         tasks = []
         if number:
             num = start
             # todo 临时测试设置10
-            for sound_info in sounds_info:
+            for sound_info in sounds_info[:5]:
                 if sound_info is False or sound_info == 0:
                     continue
                 num_ = str(num).zfill(digits)
