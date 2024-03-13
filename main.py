@@ -200,6 +200,7 @@ class Ximalaya:
         sounds_info = await asyncio.gather(*tasks)
         # xm加密链接全部解密失败，意味着可能账号超出限制，需要手动下载
         if not all(sounds_info):
+            await session.close()
             raise XMLimitError("也许触发了xm的日限制！")
         tasks = []
         if number:
