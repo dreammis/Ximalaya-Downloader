@@ -49,15 +49,22 @@ class Ximalaya:
             "pageNum": 1,
             "pageSize": 100
         }
+        # 重試3次
+        max_retry = 3
+        retry = 0
         try:
-            response = requests.get(url, headers=self.default_headers, params=params, timeout=15)
+            while True:
+                response = requests.get(url, headers=self.default_headers, params=params, timeout=15)
+                # 在此处增加对于声音的逻辑判断
+                pages = math.ceil(response.json()["data"]["trackTotalCount"] / 100)
+                break
         except Exception as e:
-            print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
-            logger.debug(f'ID为{album_id}的专辑解析失败！')
-            logger.debug(traceback.format_exc())
-            return False, False
-        # 在此处增加对于声音的逻辑判断
-        pages = math.ceil(response.json()["data"]["trackTotalCount"] / 100)
+            retry += 1
+            if retry >= max_retry:
+                print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
+                logger.debug(f'ID为{album_id}的专辑解析失败！')
+                logger.debug(traceback.format_exc())
+                raise XMLimitError(f"xm analyze_album error(unknown reason), the reason I don't know : {e}, response.json(): {response.json()}")
         sounds = []
         for page in range(1, pages + 1):
             params = {
