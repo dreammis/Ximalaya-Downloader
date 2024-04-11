@@ -20,7 +20,7 @@ from selenium.webdriver.support import expected_conditions as EC
 import selenium.common.exceptions
 import colorama
 
-from conf import BASE_DIR
+from conf import BASE_DIR, RESULT_PATH
 from utils.exceptions import XMLimitError
 
 colorama.init(autoreset=True)
@@ -38,7 +38,7 @@ class Ximalaya:
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1660.14"
         }
         self.conf_path = BASE_DIR / "config" / f"{account_name}.conf"
-        self.download_path = BASE_DIR / ".tmp" / "ximalaya"
+        self.download_path = RESULT_PATH / ".tmp" / "ximalaya"
 
     # 解析专辑，如果成功返回专辑名和专辑声音列表，否则返回False
     def analyze_album(self, album_id):
