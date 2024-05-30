@@ -5,14 +5,14 @@ import requests
 import os
 import time
 import argparse
-
+from fake_useragent import UserAgent
 
 ximalaya = main.Ximalaya()
 loop = asyncio.get_event_loop()
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-s', '--sound', type=int, help='')
-
+ua = UserAgent()
 
 if __name__ == "__main__":
     print("欢迎使用喜马拉雅下载器")
@@ -31,7 +31,7 @@ if __name__ == "__main__":
         print("检测到当前ip不在中国大陆，由于喜马拉雅官方限制，必须登录才能继续使用，将自动跳转到登录流程")
         ximalaya.login()
         headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1660.14",
+            "user-agent": ua.random,
             "cookie": ximalaya.analyze_config()[0]
         }
         logined = True
@@ -44,7 +44,7 @@ if __name__ == "__main__":
             if choice == "1":
                 ximalaya.login()
                 headers = {
-                    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1660.14",
+                    "user-agent": ua.random,
                     "cookie": ximalaya.analyze_config()[0]
                 }
                 logined = True
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     else:
         print(f"已检测到有效登录信息，当前登录用户为{username}，如需切换账号请删除config.json文件然后重新启动本程序！")
         headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1660.14",
+            "user-agent": ua.random,
             "cookie": ximalaya.analyze_config()[0]
         }
         logined = True
@@ -75,7 +75,7 @@ if __name__ == "__main__":
                 sound_id = int(_)
             except ValueError:
                 try:
-                    sound_id = re.search(r"ximalaya.com/sound/(?P<sound_id>\d+)", _).group('sound_id')
+                    sound_id = re.search(r"sound/(?P<sound_id>\d+)", _).group('sound_id')
                 except Exception:
                     print("输入有误，请重新输入！")
                     continue
@@ -112,7 +112,7 @@ if __name__ == "__main__":
                 album_id = int(input_album)
             except ValueError:
                 try:
-                    album_id = re.search(r"ximalaya.com/album/(?P<album_id>\d+)", input_album).group('album_id')
+                    album_id = re.search(r"album/(?P<album_id>\d+)", input_album).group('album_id')
                 except Exception:
                     print("输入有误，请重新输入！")
                     continue

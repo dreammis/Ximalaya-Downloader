@@ -1,19 +1,19 @@
+# -*- coding:utf-8 -*-
 import asyncio
-import base64
-import binascii
 import json
 import math
 import os
-import re
 import time
 import logging
 import traceback
+from fake_useragent import UserAgent
+from base64 import b64decode
 
 import aiofiles
 import aiohttp
 import requests
-from Crypto.Cipher import AES
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from selenium import webdriver
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -31,14 +31,59 @@ file_handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
+ua = UserAgent()
+
+
 
 class Ximalaya:
     def __init__(self, account_name="vip"):
         self.default_headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1660.14"
+            "user-agent": ua.random
         }
         self.conf_path = BASE_DIR / "config" / f"{account_name}.conf"
         self.download_path = RESULT_PATH / ".tmp" / "ximalaya"
+
+    # 解析声音，如果成功返回声音名和声音链接，否则返回False
+    def analyze_sound(self, sound_id, headers):
+        logger.debug(f'开始解析ID为{sound_id}的声音')
+        url = f"https://www.ximalaya.com/mobile-playpage/track/v3/baseInfo/{int(time.time() * 1000)}"
+        params = {
+            "device": "www2",
+            "trackId": sound_id,
+            "trackQualityLevel": 2
+        }
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+        except Exception as e:
+            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
+            logger.debug(f'ID为{sound_id}的声音解析失败！')
+            logger.debug(traceback.format_exc())
+            return False
+        try:
+            not response.json()["trackInfo"]["isAuthorized"]
+        except KeyError:
+            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败，可能因为达到每日付费音频下载上限！')
+            return False
+        if not response.json()["trackInfo"]["isAuthorized"]:
+            return 0  # 未购买或未登录vip账号
+        try:
+            sound_name = response.json()["trackInfo"]["title"]
+            encrypted_url_list = response.json()["trackInfo"]["playUrlList"]
+        except Exception as e:
+            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
+            logger.debug(f'ID为{sound_id}的声音解析失败！')
+            logger.debug(traceback.format_exc())
+            return False
+        sound_info = {"name": sound_name, 0: "", 1: "", 2: ""}
+        for encrypted_url in encrypted_url_list:
+            if encrypted_url["type"] == "M4A_128":
+                sound_info[2] = self.decrypt_url(encrypted_url["url"])
+            elif encrypted_url["type"] == "MP3_64":
+                sound_info[1] = self.decrypt_url(encrypted_url["url"])
+            elif encrypted_url["type"] == "MP3_32":
+                sound_info[0] = self.decrypt_url(encrypted_url["url"])
+        logger.debug(f'ID为{sound_id}的声音解析成功！')
+        return sound_info
 
     # 解析专辑，如果成功返回专辑名和专辑声音列表，否则返回False
     def analyze_album(self, album_id):
@@ -47,6 +92,7 @@ class Ximalaya:
         params = {
             "albumId": album_id,
             "pageNum": 1,
+            "sort": 0,
             "pageSize": 100
         }
         # 重試3次
@@ -55,7 +101,6 @@ class Ximalaya:
         try:
             while True:
                 response = requests.get(url, headers=self.default_headers, params=params, timeout=15)
-                # 在此处增加对于声音的逻辑判断
                 pages = math.ceil(response.json()["data"]["trackTotalCount"] / 100)
                 break
         except Exception as e:
@@ -86,31 +131,40 @@ class Ximalaya:
 
     # 协程解析声音
     async def async_analyze_sound(self, sound_id, session, headers):
+        retries = 3
         url = f"https://www.ximalaya.com/mobile-playpage/track/v3/baseInfo/{int(time.time() * 1000)}"
         params = {
-            "device": "web",
+            "device": "www2",
             "trackId": sound_id,
             "trackQualityLevel": 2
         }
-        try:
-            async with session.get(url, headers=headers, params=params, timeout=60) as response:
-                response_json = json.loads(await response.text())
-                sound_name = response_json["trackInfo"]["title"]
-                encrypted_url_list = response_json["trackInfo"]["playUrlList"]
-        except KeyError:
-            print('解析失败，可能达到每日下载上限')
-            return False
-        except Exception as e:
-            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
-            logger.debug(f'ID为{sound_id}的声音解析失败！')
-            logger.debug(traceback.format_exc())
-            return False
+        while retries > 0:
+            try:
+                async with session.get(url, headers=headers, params=params, timeout=20) as response:
+                    response_json = json.loads(await response.text())
+                    sound_name = response_json["trackInfo"]["title"]
+                    encrypted_url_list = response_json["trackInfo"]["playUrlList"]
+                    break
+            except KeyError:
+                print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败，可能因为达到每日付费音频下载上限')
+                return False
+            except Exception as e:
+                logger.debug(f'ID为{sound_id}的声音解析失败！')
+                logger.debug(traceback.format_exc())
+                if retries == 0:
+                    print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
+                    return False
+            retries -= 1
         if not response_json["trackInfo"]["isAuthorized"]:
             return 0  # 未购买或未登录vip账号
         sound_info = {"name": sound_name, 0: "", 1: "", 2: ""}
         for encrypted_url in encrypted_url_list:
             if encrypted_url["type"] == "M4A_128":
                 sound_info[2] = self.decrypt_url(encrypted_url["url"])
+            elif encrypted_url["type"] == "M4A_64":
+                sound_info[1] = self.decrypt_url(encrypted_url["url"])
+            elif encrypted_url["type"] == "M4A_24":
+                sound_info[0] = self.decrypt_url(encrypted_url["url"])
             elif encrypted_url["type"] == "MP3_64":
                 sound_info[1] = self.decrypt_url(encrypted_url["url"])
             elif encrypted_url["type"] == "MP3_32":
@@ -188,7 +242,7 @@ class Ximalaya:
             except Exception as e:
                 logger.debug(f'{sound_name}第{global_retries * 3 + 4 - retries}次下载失败！')
                 logger.debug(traceback.format_exc())
-                retries += 1
+                retries -= 1
                 if os.path.exists(f"{path}/{album_name}/{sound_name}.{type}"):
                     os.remove(f"{path}/{album_name}/{sound_name}.{type}")
         if retries == 0:
@@ -239,13 +293,26 @@ class Ximalaya:
         await session.close()
 
     # 解密vip声音url
-    def decrypt_url(self, ciphertext):
-        key = binascii.unhexlify("aaad3e4fd540b0f79dca95606e72bf93")
-        ciphertext = base64.urlsafe_b64decode(ciphertext + '=' * (4 - len(ciphertext) % 4))
-        cipher = AES.new(key, AES.MODE_ECB)
-        plaintext = cipher.decrypt(ciphertext)
-        plaintext = re.sub(r"[^\x20-\x7E]", "", plaintext.decode("utf-8"))
-        return plaintext
+    def decrypt_url(self, encrypted_url):
+        o = bytes([183, 174, 108, 16, 131, 159, 250, 5, 239, 110, 193, 202, 153, 137, 251, 176, 119, 150, 47, 204, 97, 237, 1, 71, 177, 42, 88, 218, 166, 82, 87, 94, 14, 195, 69, 127, 215, 240, 225, 197, 238, 142, 123, 44, 219, 50, 190, 29, 181, 186, 169, 98, 139, 185, 152, 13, 141, 76, 6, 157, 200, 132, 182, 49, 20, 116, 136, 43, 155, 194, 101, 231, 162, 242, 151, 213, 53, 60, 26, 134, 211, 56, 28, 223, 107, 161, 199, 15, 229, 61, 96, 41, 66, 158, 254, 21, 165, 253, 103, 89, 3, 168, 40, 246, 81, 95, 58, 31, 172, 78, 99, 45, 148, 187, 222, 124, 55, 203, 235, 64, 68, 149, 180, 35, 113, 207, 118, 111, 91, 38, 247, 214, 7, 212, 209, 189, 241, 18, 115, 173, 25, 236, 121, 249, 75, 57, 216, 10, 175, 112, 234, 164, 70, 206, 198, 255, 140, 230, 12, 32, 83, 46, 245, 0, 62, 227, 72, 191, 156, 138, 248, 114, 220, 90, 84, 170, 128, 19, 24, 122, 146, 80, 39, 37, 8, 34, 22, 11, 93, 130, 63, 154, 244, 160, 144, 79, 23, 133, 92, 54, 102, 210, 65, 67, 27, 196, 201, 106, 143, 52, 74, 100, 217, 179, 48, 233, 126, 117, 184, 226, 85, 171, 167, 86, 2, 147, 17, 135, 228, 252, 105, 30, 192, 129, 178, 120, 36, 145, 51, 163, 77, 205, 73, 4, 188, 125, 232, 33, 243, 109, 224, 104, 208, 221, 59, 9])
+        a = bytes([204, 53, 135, 197, 39, 73, 58, 160, 79, 24, 12, 83, 180, 250, 101, 60, 206, 30, 10, 227, 36, 95, 161, 16, 135, 150, 235, 116, 242, 116, 165, 171])
+        encrypted_url = encrypted_url.replace('_', '/').replace('-', '+')
+        padding = '=' * (-len(encrypted_url) % 4)
+        encrypted_data = b64decode(encrypted_url + padding)
+        if len(encrypted_data) < 16:
+            return encrypted_url
+        data = encrypted_data[:-16]
+        iv = encrypted_data[-16:]
+        decrypted_data = bytearray(data)
+        for i in range(len(decrypted_data)):
+            decrypted_data[i] = o[decrypted_data[i]]
+        for i in range(0, len(decrypted_data), 16):
+            block = decrypted_data[i:i+16]
+            decrypted_data[i:i+16] = bytes(a ^ b for a, b in zip(block, iv))
+        for i in range(0, len(decrypted_data), 32):
+            block = decrypted_data[i:i+32]
+            decrypted_data[i:i+32] = bytes(a ^ b for a, b in zip(block, a))
+        return decrypted_data.decode('utf-8')
 
     # 判断专辑是否为付费专辑，如果是免费专辑返回0，如果是已购买的付费专辑返回1，如果是未购买的付费专辑返回2，如果解析失败返回False
     def judge_album(self, album_id, headers):
@@ -281,7 +348,7 @@ class Ximalaya:
     def judge_cookie(self, cookie):
         url = "https://www.ximalaya.com/revision/my/getCurrentUserInfo"
         headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1660.14",
+            "user-agent": ua.random,
             "cookie": cookie
         }
         try:
@@ -329,7 +396,6 @@ class Ximalaya:
         username = self.judge_cookie(cookie)
         print(f"成功登录账号{username}！")
         return cookie
-
 
 
 if __name__ == "__main__":
