@@ -17,6 +17,7 @@ from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from selenium import webdriver
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
 import selenium.common.exceptions
 import colorama
 
@@ -102,35 +103,53 @@ class Ximalaya:
             "sort": 0,
             "pageSize": 100
         }
-        # 重試3次
-        max_retry = 3
-        retry = 0
-        try:
-            while True:
+        self.default_headers["referer"] = f"https://www.ximalaya.com/album/{album_id}"
+        retries = 5
+        while True:
+            try:
                 response = requests.get(url, headers=self.default_headers, params=params, timeout=15)
-                pages = math.ceil(response.json()["data"]["trackTotalCount"] / 100)
-                break
-        except Exception as e:
-            retry += 1
-            if retry >= max_retry:
+            except Exception as e:
                 print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
                 logger.debug(f'ID为{album_id}的专辑解析失败！')
                 logger.debug(traceback.format_exc())
-                raise XMLimitError(f"xm analyze_album error(unknown reason), the reason I don't know : {e}, response.json(): {response.json()}")
+                raise XMLimitError(
+                    f"xm analyze_album error(unknown reason), the reason I don't know : {e}, response.json(): {response.json()}")
+            if response.json()["data"]["tracks"] == []:
+                retries -= 1
+            else:
+                break
+            if retries == 0:
+                print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
+                logger.debug(f'ID为{album_id}的专辑解析失败！（getTracksList错误）')
+                return False, False
+        pages = math.ceil(response.json()["data"]["trackTotalCount"] / 100)
         sounds = []
         for page in range(1, pages + 1):
             params = {
                 "albumId": album_id,
                 "pageNum": page,
+                "sort": 0,
                 "pageSize": 100
             }
-            try:
-                response = requests.get(url, headers=self.default_headers, params=params, timeout=30)
-            except Exception as e:
-                print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
-                logger.debug(f'ID为{album_id}的专辑解析失败！')
-                logger.debug(traceback.format_exc())
-                return False, False
+            retries = 5
+            while True:
+                try:
+                    response = requests.get(url, headers=self.default_headers, params=params, timeout=30)
+                except Exception as e:
+                    print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
+                    logger.debug(f'ID为{album_id}的专辑解析失败！')
+                    logger.debug(traceback.format_exc())
+                    return False, False
+                if response.json()["data"]["tracks"] == []:
+                    print(f"第{page}页解析失败第{6-retries}次，共{pages}页")
+                    retries -= 1
+                else:
+                    print(f"第{page}页解析成功，共{pages}页")
+                    break
+                if retries == 0:
+                    print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
+                    logger.debug(f'ID为{album_id}的专辑解析失败！（getTracksList错误）')
+                    return False, False
             sounds += response.json()["data"]["tracks"]
         album_name = sounds[0]["albumTitle"]
         logger.debug(f'ID为{album_id}的专辑解析成功')
