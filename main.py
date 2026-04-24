@@ -3,11 +3,21 @@ import asyncio
 import json
 import math
 import os
+import re
 import time
 import logging
 import traceback
-from fake_useragent import UserAgent
+import hashlib
+import random
 from base64 import b64decode
+
+try:
+    from fake_useragent import UserAgent
+except ImportError:
+    class UserAgent:  # type: ignore[override]
+        @property
+        def random(self):
+            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 import aiofiles
 import aiohttp
@@ -15,6 +25,7 @@ import requests
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
@@ -39,10 +50,242 @@ ua = UserAgent()
 class Ximalaya:
     def __init__(self, account_name="vip"):
         self.default_headers = {
-            "user-agent": ua.random
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "accept": "application/json, text/plain, */*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+            "dnt": "1",
+            "origin": "https://www.ximalaya.com",
+            "priority": "u=1, i",
+            "sec-ch-ua": '"Chromium";v="124", "Microsoft Edge";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
         self.conf_path = BASE_DIR / "config" / f"{account_name}.conf"
         self.download_path = RESULT_PATH / ".tmp" / "ximalaya"
+
+    def build_browser_options(self):
+        option = webdriver.ChromeOptions()
+        option.add_experimental_option("detach", False)
+        option.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
+        option.add_experimental_option('useAutomationExtension', False)
+        option.add_argument("--disable-blink-features=AutomationControlled")
+        return option
+
+    def create_stealth_driver(self):
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=self.build_browser_options(),
+        )
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """
+        })
+        return driver
+
+    # 生成喜马拉雅新版签名 xm-sign (V2)
+    def get_xm_sign(self, cookie_str=""):
+        try:
+            # 现代签名规则：BrowserID&&SessionID
+            # BrowserID 对应 cookie 中的 wfp
+            # SessionID 对应 cookie 中的 HWWAFSESID
+            cookies = {}
+            if cookie_str:
+                for c in cookie_str.split(';'):
+                    if '=' in c:
+                        k, v = c.strip().split('=', 1)
+                        cookies[k] = v
+            
+            wfp = cookies.get('wfp', 'ACM3OGU0YjlkYzZlZjAzM2Rlz_rWpwVpJOV4bXdlYl93d3c') # 默认值可能无效，建议使用真实cookie
+            sessid = cookies.get('HWWAFSESID', '')
+            
+            # 如果没有 sessid，可能是未初始化会话
+            # xm-sign 格式: wfp&&sessid
+            sign = f"{wfp}&&{sessid}"
+            return sign, wfp
+        except Exception as e:
+            logger.error(f"生成签名失败: {e}")
+            return "&&", ""
+
+    def get_headers(self, cookie=None):
+        headers = self.default_headers.copy()
+        if not cookie:
+            cookie = self.analyze_config().replace('"', '') # 去除多余引号
+
+        if cookie:
+            headers["cookie"] = cookie
+        sign, wfp = self.get_xm_sign(cookie)
+        if sign != "&&":
+            headers["xm-sign"] = sign
+        if wfp:
+            headers["xm-fp"] = wfp
+        headers["xm-page-viewid"] = f"{int(time.time()*1000)}{random.randint(100, 999)}"
+        return headers
+
+    def parse_browser_album_data(self, album_name, track_links):
+        sounds = []
+        seen_track_ids = set()
+        clean_album_name = album_name.strip()
+
+        for index, track in enumerate(track_links, start=1):
+            href = (track.get("href") or "").strip()
+            title = (track.get("text") or "").strip()
+            match = re.search(r"/sound/(\d+)", href)
+            if not match:
+                continue
+
+            track_id = int(match.group(1))
+            if track_id in seen_track_ids:
+                continue
+            seen_track_ids.add(track_id)
+
+            sounds.append({
+                "trackId": track_id,
+                "albumTitle": clean_album_name,
+                "title": title,
+                "index": len(sounds) + 1,
+            })
+
+        return clean_album_name, sounds
+
+    def parse_mobile_album_data(self, tracks):
+        if not tracks:
+            return False, False
+
+        album_name = (tracks[0].get("albumTitle") or "").strip()
+        sounds = []
+        for index, track in enumerate(tracks, start=1):
+            if not track.get("trackId"):
+                continue
+            sound = dict(track)
+            sound["albumTitle"] = (sound.get("albumTitle") or album_name).strip()
+            sound["title"] = (sound.get("title") or "").strip()
+            sound["index"] = index
+            sounds.append(sound)
+        if not sounds:
+            return False, False
+        return album_name, sounds
+
+    def build_track_api_error(self, sound_id, response_json):
+        ret = response_json.get("ret")
+        msg = response_json.get("msg", "")
+        if ret == 1001:
+            return {
+                "__xm_error__": "system_busy",
+                "sound_id": sound_id,
+                "ret": ret,
+                "msg": msg,
+            }
+        return {
+            "__xm_error__": "unexpected_response",
+            "sound_id": sound_id,
+            "ret": ret,
+            "msg": msg,
+        }
+
+    def parse_track_api_response(self, sound_id, response_json):
+        track_info = response_json.get("trackInfo")
+        if track_info:
+            return track_info
+        return self.build_track_api_error(sound_id, response_json)
+
+    def scrape_album_from_mobile_api(self, album_id):
+        logger.debug(f'开始使用移动端接口解析专辑 {album_id}')
+        url = "https://mobile.ximalaya.com/mobile/playlist/album/page"
+        all_tracks = []
+        try:
+            response = requests.get(url, params={"albumId": album_id, "pageId": 1}, timeout=15)
+            res_json = response.json()
+            if res_json.get("ret") != 0:
+                logger.debug(f"移动端接口第一页失败: {res_json}")
+                return False, False
+
+            all_tracks.extend(res_json.get("list") or [])
+            max_page_id = int(res_json.get("maxPageId") or 1)
+            for page_id in range(2, max_page_id + 1):
+                page_response = requests.get(
+                    url,
+                    params={"albumId": album_id, "pageId": page_id},
+                    timeout=15,
+                )
+                page_json = page_response.json()
+                if page_json.get("ret") != 0:
+                    logger.debug(f"移动端接口第{page_id}页失败: {page_json}")
+                    return False, False
+                all_tracks.extend(page_json.get("list") or [])
+
+            album_name, sounds = self.parse_mobile_album_data(all_tracks)
+            if sounds:
+                logger.debug(f'移动端接口解析专辑成功，获取到 {len(sounds)} 个声音')
+            return album_name, sounds
+        except Exception:
+            logger.debug(f'移动端接口解析专辑 {album_id} 失败')
+            logger.debug(traceback.format_exc())
+            return False, False
+
+    def scrape_album_from_browser(self, album_id):
+        logger.debug(f'API命中风控，开始使用浏览器解析专辑 {album_id}')
+        driver = None
+        try:
+            driver = self.create_stealth_driver()
+            album_url = f"https://www.ximalaya.com/album/{album_id}"
+            driver.get(album_url)
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script(
+                    "return document.querySelectorAll('a[href*=\"/sound/\"]').length"
+                ) > 0
+            )
+
+            stable_rounds = 0
+            previous_count = 0
+            for _ in range(15):
+                time.sleep(0.8)
+                current_count = driver.execute_script(
+                    "return document.querySelectorAll('a[href*=\"/sound/\"]').length"
+                )
+                if current_count == previous_count:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 0
+                    previous_count = current_count
+                if stable_rounds >= 2:
+                    break
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+
+            browser_data = driver.execute_script("""
+                const titleNode = document.querySelector('h1');
+                const pageTitle = document.title || '';
+                const albumName = (titleNode && titleNode.textContent.trim())
+                    || pageTitle.split('_')[0].trim()
+                    || pageTitle.trim();
+                const trackLinks = Array.from(document.querySelectorAll('a[href*="/sound/"]'))
+                    .map((node) => ({
+                        text: (node.textContent || '').trim(),
+                        href: node.href || '',
+                    }));
+                return { albumName, trackLinks };
+            """)
+            album_name, sounds = self.parse_browser_album_data(
+                browser_data.get("albumName", ""),
+                browser_data.get("trackLinks", []),
+            )
+            if not sounds:
+                return False, False
+            logger.debug(f'浏览器解析专辑成功，获取到 {len(sounds)} 个声音')
+            return album_name, sounds
+        except Exception:
+            logger.debug(f'浏览器解析专辑 {album_id} 失败')
+            logger.debug(traceback.format_exc())
+            return False, False
+        finally:
+            if driver:
+                driver.quit()
 
     # 解析声音，如果成功返回声音名和声音链接，否则返回False
     def analyze_sound(self, sound_id, headers):
@@ -53,24 +296,37 @@ class Ximalaya:
             "trackId": sound_id,
             "trackQualityLevel": 2
         }
-        headers["referer"] = f"https://www.ximalaya.com/sound/{sound_id}"
+        request_headers = dict(headers)
+        request_headers["referer"] = f"https://www.ximalaya.com/sound/{sound_id}"
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=15)
+            response = requests.get(url, headers=request_headers, params=params, timeout=15)
         except Exception as e:
             print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
             logger.debug(f'ID为{sound_id}的声音解析失败！')
             logger.debug(traceback.format_exc())
             return False
-        try:
-            not response.json()["trackInfo"]["isAuthorized"]
-        except KeyError:
-            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败，可能因为达到每日付费音频下载上限！')
+        response_json = response.json()
+        track_info = self.parse_track_api_response(sound_id, response_json)
+        if isinstance(track_info, dict) and track_info.get("__xm_error__"):
+            if track_info["__xm_error__"] == "system_busy":
+                print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败，接口返回系统繁忙，疑似被风控或限流')
+            else:
+                print(
+                    colorama.Fore.RED
+                    + f"ID为{sound_id}的声音解析失败，接口返回异常: ret={track_info.get('ret')} msg={track_info.get('msg')}"
+                )
+            logger.debug(f'ID为{sound_id}的声音接口异常: {response_json}')
             return False
-        if not response.json()["trackInfo"]["isAuthorized"]:
+        try:
+            not track_info["isAuthorized"]
+        except KeyError:
+            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败，接口返回数据缺失！')
+            return False
+        if not track_info["isAuthorized"]:
             return 0  # 未购买或未登录vip账号
         try:
-            sound_name = response.json()["trackInfo"]["title"]
-            encrypted_url_list = response.json()["trackInfo"]["playUrlList"]
+            sound_name = track_info["title"]
+            encrypted_url_list = track_info["playUrlList"]
         except Exception as e:
             print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
             logger.debug(f'ID为{sound_id}的声音解析失败！')
@@ -101,56 +357,87 @@ class Ximalaya:
             "albumId": album_id,
             "pageNum": 1,
             "sort": 0,
-            "pageSize": 100
+            "pageSize": 30
         }
-        self.default_headers["referer"] = f"https://www.ximalaya.com/album/{album_id}"
+        headers = self.get_headers()
+        headers["authority"] = "www.ximalaya.com"
+        headers["referer"] = f"https://www.ximalaya.com/album/{album_id}"
         retries = 5
         while True:
             try:
-                response = requests.get(url, headers=self.default_headers, params=params, timeout=15)
+                response = requests.get(url, headers=headers, params=params, timeout=15)
+                res_json = response.json()
             except Exception as e:
                 print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
                 logger.debug(f'ID为{album_id}的专辑解析失败！')
                 logger.debug(traceback.format_exc())
                 raise XMLimitError(
-                    f"xm analyze_album error(unknown reason), the reason I don't know : {e}, response.json(): {response.json()}")
-            if response.json()["data"]["tracks"] == []:
-                retries -= 1
-            else:
+                    f"xm analyze_album error(unknown reason): {e}")
+            tracks = res_json.get("data", {}).get("tracks") or []
+            if tracks and res_json.get("ret") in (0, 200):
                 break
+            if res_json.get("data", {}).get("riskLevel"):
+                logger.debug(f"专辑接口命中风控: {res_json}")
+                mobile_result = self.scrape_album_from_mobile_api(album_id)
+                if mobile_result != (False, False):
+                    return mobile_result
+                return self.scrape_album_from_browser(album_id)
+            if tracks == []:
+                logger.debug(f"服务端返回数据为空，完整内容: {res_json}")
+                retries -= 1
+            elif res_json.get("ret") not in (0, 200):
+                logger.debug(f"接口返回码错误: {res_json}")
+                retries -= 1
             if retries == 0:
-                print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
-                logger.debug(f'ID为{album_id}的专辑解析失败！（getTracksList错误）')
-                return False, False
-        pages = math.ceil(response.json()["data"]["trackTotalCount"] / 100)
+                logger.debug(f'ID为{album_id}的专辑接口多次失败，切换浏览器兜底')
+                mobile_result = self.scrape_album_from_mobile_api(album_id)
+                if mobile_result != (False, False):
+                    return mobile_result
+                return self.scrape_album_from_browser(album_id)
+        pages = math.ceil(response.json()["data"]["trackTotalCount"] / params["pageSize"])
         sounds = []
         for page in range(1, pages + 1):
             params = {
                 "albumId": album_id,
                 "pageNum": page,
                 "sort": 0,
-                "pageSize": 100
+                "pageSize": 30
             }
             retries = 5
             while True:
                 try:
-                    response = requests.get(url, headers=self.default_headers, params=params, timeout=30)
+                    headers = self.get_headers() # 重新生成包含签名的头部
+                    headers["referer"] = f"https://www.ximalaya.com/album/{album_id}"
+                    response = requests.get(url, headers=headers, params=params, timeout=30)
+                    res_json = response.json()
                 except Exception as e:
                     print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
                     logger.debug(f'ID为{album_id}的专辑解析失败！')
                     logger.debug(traceback.format_exc())
-                    return False, False
-                if response.json()["data"]["tracks"] == []:
+                    mobile_result = self.scrape_album_from_mobile_api(album_id)
+                    if mobile_result != (False, False):
+                        return mobile_result
+                    return self.scrape_album_from_browser(album_id)
+                page_tracks = res_json.get("data", {}).get("tracks") or []
+                if res_json.get("data", {}).get("riskLevel"):
+                    logger.debug(f"翻页命中风控，切换浏览器解析: {res_json}")
+                    mobile_result = self.scrape_album_from_mobile_api(album_id)
+                    if mobile_result != (False, False):
+                        return mobile_result
+                    return self.scrape_album_from_browser(album_id)
+                if page_tracks == []:
                     print(f"第{page}页解析失败第{6-retries}次，共{pages}页")
                     retries -= 1
                 else:
                     print(f"第{page}页解析成功，共{pages}页")
                     break
                 if retries == 0:
-                    print(colorama.Fore.RED + f'ID为{album_id}的专辑解析失败！')
-                    logger.debug(f'ID为{album_id}的专辑解析失败！（getTracksList错误）')
-                    return False, False
-            sounds += response.json()["data"]["tracks"]
+                    logger.debug(f'第{page}页接口重试失败，切换浏览器解析')
+                    mobile_result = self.scrape_album_from_mobile_api(album_id)
+                    if mobile_result != (False, False):
+                        return mobile_result
+                    return self.scrape_album_from_browser(album_id)
+            sounds += page_tracks
         album_name = sounds[0]["albumTitle"]
         logger.debug(f'ID为{album_id}的专辑解析成功')
         return album_name, sounds
@@ -164,16 +451,32 @@ class Ximalaya:
             "trackId": sound_id,
             "trackQualityLevel": 2
         }
-        headers["referer"] = f"https://www.ximalaya.com/sound/{sound_id}"
+        request_headers = dict(headers)
+        request_headers["referer"] = f"https://www.ximalaya.com/sound/{sound_id}"
+        sign, wfp = self.get_xm_sign(request_headers.get("cookie", ""))
+        request_headers["xm-sign"] = sign
+        if wfp:
+            request_headers["xm-fp"] = wfp
         while retries > 0:
             try:
-                async with session.get(url, headers=headers, params=params, timeout=20) as response:
+                async with session.get(url, headers=request_headers, params=params, timeout=20) as response:
                     response_json = json.loads(await response.text())
-                    sound_name = response_json["trackInfo"]["title"]
-                    encrypted_url_list = response_json["trackInfo"]["playUrlList"]
+                    track_info = self.parse_track_api_response(sound_id, response_json)
+                    if isinstance(track_info, dict) and track_info.get("__xm_error__"):
+                        if track_info["__xm_error__"] == "system_busy":
+                            print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败，接口返回系统繁忙，疑似被风控或限流')
+                        else:
+                            print(
+                                colorama.Fore.RED
+                                + f"ID为{sound_id}的声音解析失败，接口返回异常: ret={track_info.get('ret')} msg={track_info.get('msg')}"
+                            )
+                        logger.debug(f'ID为{sound_id}的声音接口异常: {response_json}')
+                        return track_info
+                    sound_name = track_info["title"]
+                    encrypted_url_list = track_info["playUrlList"]
                     break
             except KeyError:
-                print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败，可能因为达到每日付费音频下载上限')
+                print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败，接口返回数据缺失')
                 return False
             except Exception as e:
                 logger.debug(f'ID为{sound_id}的声音解析失败！')
@@ -182,7 +485,7 @@ class Ximalaya:
                     print(colorama.Fore.RED + f'ID为{sound_id}的声音解析失败！')
                     return False
             retries -= 1
-        if not response_json["trackInfo"]["isAuthorized"]:
+        if not track_info["isAuthorized"]:
             return 0  # 未购买或未登录vip账号
         if encrypted_url_list[0]["type"][:2] == "AI":
             sound_info = {"name": sound_name, 0: "", 1: "", 2: ""}
@@ -288,10 +591,22 @@ class Ximalaya:
             sound_id = sounds[i]["trackId"]
             tasks.append(asyncio.create_task(self.async_analyze_sound(sound_id, session, headers)))
         sounds_info = await asyncio.gather(*tasks)
+        track_api_errors = [
+            result for result in sounds_info
+            if isinstance(result, dict) and result.get("__xm_error__")
+        ]
+        if track_api_errors:
+            await session.close()
+            first_error = track_api_errors[0]
+            if first_error.get("__xm_error__") == "system_busy":
+                raise XMLimitError("xm 单集解析接口返回 ret=1001（系统繁忙），这是风控/限流，不是 judge_album 误判")
+            raise XMLimitError(
+                f"xm 单集解析接口返回异常: ret={first_error.get('ret')} msg={first_error.get('msg')}"
+            )
         # xm加密链接全部解密失败，意味着可能账号超出限制，需要手动下载
         if not all(sounds_info):
             await session.close()
-            raise XMLimitError("也许触发了xm的日限制！")
+            raise XMLimitError("xm 单集解析失败，可能未购买、cookie失效，或接口受限")
         tasks = []
         if number:
             num = start
@@ -350,6 +665,10 @@ class Ximalaya:
         params = {
             "albumId": album_id
         }
+        sign, wfp = self.get_xm_sign(headers.get("cookie", ""))
+        headers["xm-sign"] = sign
+        if wfp:
+            headers["xm-fp"] = wfp
         try:
             response = requests.get(url, headers=headers, params=params, timeout=15)
         except Exception as e:
@@ -395,10 +714,20 @@ class Ximalaya:
     def login(self):
         print("在浏览器中登录并自动提取cookie")
         print("Google Chrome")
-        option = webdriver.ChromeOptions()
+        option = self.build_browser_options()
         option.add_experimental_option("detach", True)
-        option.add_experimental_option('excludeSwitches', ['enable-logging'])
-        driver = webdriver.Chrome(ChromeDriverManager().install(), options=option)
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=option,
+        )
+        # 移除 webdriver 标识
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """
+        })
         print("请在弹出的浏览器中登录喜马拉雅账号，登陆成功浏览器会自动关闭")
         driver.get("https://passport.ximalaya.com/page/web/login")
         try:
